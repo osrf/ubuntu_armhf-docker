@@ -1,69 +1,55 @@
-#!/usr/bin/env sh
-#
-# Build armv7l Ubuntu base image for docker (on x86 as well as armhf machines)
-# - needs qemu-user-static installed
-# - image will be tagged with the chosen version
-#
-# Synopsis: build.sh [VERSION] [IMAGE NAME]
-#
-# Defaults: build.sh 14.04 <YOUR-DOCKER-USER>/armhf-ubuntu
+#!/bin/bash -x
+### Build a docker image for ubuntu armhf.
 
-# Fail on error
 set -e
 
-VERSION=${1:-14.04}
-ARCHIVE_NAME=ubuntu-core-$VERSION-core-armhf.tar
-BASE_IMAGE_URL=http://cdimage.ubuntu.com/ubuntu-core/releases/$VERSION/release/${ARCHIVE_NAME}.gz
+### settings
+arch=armhf
+suite=trusty
+suite_number=14.04
+chroot_dir="/var/chroot/ubuntu_armhf_$suite"
+docker_image="osrf/ubuntu_armhf:$suite"
 
-# Check if running on armv7l architecture
-if [ $(uname -m) = "armv7l" ]; then
-  ON_ARM=1
-fi
+### make sure that the required tools are installed
+#apt-get install -y docker.io qemu-arm-static
 
-echo ARM: $ON_ARM
+# fetch and unpack base image
+ARCHIVE_NAME=ubuntu-core-$suite_number-core-armhf.tar
+BASE_IMAGE_URL=http://cdimage.ubuntu.com/ubuntu-core/releases/$suite/release/$ARCHIVE_NAME.gz
+mkdir -p $chroot_dir
+#curl $BASE_IMAGE_URL -o /tmp/$ARCHIVE_NAME.gz
+tar -xf /tmp/$ARCHIVE_NAME.gz -C $chroot_dir
 
-# Use given image name or the default one (with your username)
-if [ -n "$2" ]; then
-  IMAGE_NAME=$2:$VERSION
-else
-  DOCKER_USER=$(sudo docker info | grep Username | awk '{print $2;}')
-  IMAGE_NAME=$DOCKER_USER/armhf-ubuntu:$VERSION
-fi
+# a few minor docker-specific tweaks
+# see https://github.com/docker/docker/blob/master/contrib/mkimage/debootstrap
 
-echo Building $IMAGE_NAME
+# prevent init scripts from running during install/update
+echo '#!/bin/sh' > $chroot_dir/usr/sbin/policy-rc.d
+echo 'exit 101' >> $chroot_dir/usr/sbin/policy-rc.d
+chmod +x $chroot_dir/usr/sbin/policy-rc.d
 
-# Unzip Ubuntu core image
-curl $BASE_IMAGE_URL | gunzip -c >/tmp/${ARCHIVE_NAME}
+# force dpkg not to call sync() after package extraction (speeding up installs)
+echo 'force-unsafe-io' > $chroot_dir/etc/dpkg/dpkg.cfg.d/docker-apt-speedup
 
-# Keep us lean by effectively running "apt-get clean" after every install
-aptGetClean='"rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true";'
-aptConfPath=etc/apt/apt.conf.d
-mkdir -p /tmp/$aptConfPath
-echo >&2 "+ cat > '/tmp/$aptConfPath/docker-clean'"
-cat > "/tmp/$aptConfPath/docker-clean" <<-EOF
-  DPkg::Post-Invoke { ${aptGetClean} };
-  APT::Update::Post-Invoke { ${aptGetClean} };
+# _keep_ us lean by effectively running "apt-get clean" after every install
+echo 'DPkg::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' > $chroot_dir/etc/apt/apt.conf.d/docker-clean
+echo 'APT::Update::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' >> $chroot_dir/etc/apt/apt.conf.d/docker-clean
+echo 'Dir::Cache::pkgcache ""; Dir::Cache::srcpkgcache "";' >> $chroot_dir/etc/apt/apt.conf.d/docker-clean
 
-  Dir::Cache::pkgcache "";
-  Dir::Cache::srcpkgcache "";
-EOF
+# remove apt-cache translations for fast "apt-get update"
+echo 'Acquire::Languages "none";' > $chroot_dir/etc/apt/apt.conf.d/docker-no-languages
 
-# Remove apt-cache translations for fast "apt-get update"
-echo >&2 "+ cat > '/tmp/$aptConfPath/docker-no-languages'"
-echo 'Acquire::Languages "none";' > "/tmp/$aptConfPath/docker-no-languages"
+# store Apt lists files gzipped on-disk for smaller size
+echo 'Acquire::GzipIndexes "true"; Acquire::CompressionTypes::Order:: "gz";' > $chroot_dir/etc/apt/apt.conf.d/docker-gzip-indexes
 
-# Add files to base image and import it
-cd /tmp && tar rf /tmp/${ARCHIVE_NAME} -P $aptConfPath
-#if [ ! $ON_ARM ]; then
-  tar rf /tmp/${ARCHIVE_NAME} -P /usr/bin/qemu-arm-static
-#fi
-cat /tmp/${ARCHIVE_NAME} | sudo docker import - $IMAGE_NAME
-rm /tmp/${ARCHIVE_NAME} /tmp/$aptConfPath -fR
+# add qemu to base image
+cp /usr/bin/qemu-arm-static $chroot_dir/usr/bin/
 
-# Use qemu unless running on armv7l architecture
-#if [ ! $ON_ARM -a ! -f /proc/sys/fs/binfmt_misc/arm ]; then
-  sudo sh -c 'echo ":arm:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-arm-static:" >/proc/sys/fs/binfmt_misc/register'
-#fi
+### create a tar archive from the chroot directory
+tar cfz ubuntu_armhf_$suite.tgz -C $chroot_dir .
+
+### import this tar archive into a docker image:
+cat ubuntu_armhf_$suite.tgz | docker import - $docker_image
 
 # Update packages
 # FIXME Replace udev hold as soon as it does correctly upgrade on qemu
@@ -72,12 +58,14 @@ UPDATE_SCRIPT="dpkg-divert --local --rename --add /sbin/initctl && \
                echo 'udev hold' | dpkg --set-selections && \
                sed -i -e 's/# \(.*universe\)$/\1/' /etc/apt/sources.list && \
                export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get -y upgrade"
-CID=`sudo docker run -d $IMAGE_NAME sh -c "$UPDATE_SCRIPT"`
+CID=`sudo docker run -d $docker_image sh -c "$UPDATE_SCRIPT"`
 sudo docker attach $CID
-sudo docker commit $CID $IMAGE_NAME
+sudo docker commit $CID $docker_image
 sudo docker rm $CID
 
-echo "Successfully built image $IMAGE_NAME."
+# ### push image to Docker Hub
+docker push $docker_image
 
-docker tag $IMAGE_NAME $2:trusty
-docker push $2:trusty
+# ### cleanup
+rm ubuntu_armhf_$suite.tgz
+rm -rf $chroot_dir

@@ -17,7 +17,9 @@ docker_image="osrf/ubuntu_armhf:$suite"
 ARCHIVE_NAME=ubuntu-core-$suite_number-core-armhf.tar
 BASE_IMAGE_URL=http://cdimage.ubuntu.com/ubuntu-core/releases/$suite/release/$ARCHIVE_NAME.gz
 mkdir -p $chroot_dir
-#curl $BASE_IMAGE_URL -o /tmp/$ARCHIVE_NAME.gz
+if [ ! -e /tmp/$ARCHIVE_NAME.gz ]; then
+  curl $BASE_IMAGE_URL -o /tmp/$ARCHIVE_NAME.gz
+fi
 tar -xf /tmp/$ARCHIVE_NAME.gz -C $chroot_dir
 
 # a few minor docker-specific tweaks
@@ -63,9 +65,9 @@ sudo docker attach $CID
 sudo docker commit $CID $docker_image
 sudo docker rm $CID
 
-# ### push image to Docker Hub
-docker push $docker_image
-
 # ### cleanup
 rm ubuntu_armhf_$suite.tgz
 rm -rf $chroot_dir
+
+### push image to Docker Hub
+echo "Test the image $docker_image and push it to upstream with 'docker push $docker_image'"
